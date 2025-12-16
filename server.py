@@ -74,6 +74,25 @@ def analyze():
         return jsonify({'results': results, 'locks': locks, 'lock_count': len(locks)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
+@app.route('/api/games/today')
+def get_games():
+    try:
+        from nba_api.live.nba.endpoints import scoreboard
+        board = scoreboard.ScoreBoard()
+        data = board.get_dict()
+        games = []
+        for g in data.get('scoreboard', {}).get('games', []):
+            games.append({
+                'game_id': g.get('gameId'),
+                'home_team': g.get('homeTeam', {}).get('teamTricode'),
+                'away_team': g.get('awayTeam', {}).get('teamTricode'),
+                'home_score': g.get('homeTeam', {}).get('score'),
+                'away_score': g.get('awayTeam', {}).get('score'),
+                'status': g.get('gameStatusText'),
+                'start_time': g.get('gameTimeUTC')
+            })
+        return jsonify({'date': datetime.now().strftime('%Y-%m-%d'), 'games': games, 'count': len(games)})
+    except Exception as e:
+        return jsonify({'error': str(e), 'games': []}), 500
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
