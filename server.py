@@ -6,6 +6,7 @@ from nba_api.stats.static import players
 from nba_api.live.nba.endpoints import scoreboard
 from datetime import datetime
 import time
+import requests
 
 app = Flask(__name__)
 CORS(app)
@@ -22,12 +23,48 @@ def health():
 
 @app.route('/api/injuries')
 def get_injuries():
-    return jsonify({
-        'updated': datetime.now().isoformat(),
-        'source': 'Cached (Java required for live)',
-        'teams': {},
-        'injured_players': []
-    })
+    try:
+        # Fetch from ESPN NBA injuries page
+        url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        
+        teams = {}
+        injured_players = []
+        
+        for team in data.get('injuries', []):
+            team_abbr = team.get('team', {}).get('abbreviation', 'UNK')
+            teams[team_abbr] = []
+            
+            for player in team.get('injuries', []):
+                name = player.get('athlete', {}).get('displayName', '')
+                status = player.get('status', '')
+                reason = player.get('details', {}).get('detail', '') or player.get('longComment', '')
+                
+                teams[team_abbr].append({
+                    'name': name,
+                    'status': status,
+                    'reason': reason
+                })
+                
+                if status in ['Out', 'Questionable', 'Doubtful', 'Day-To-Day']:
+                    injured_players.append(name.lower())
+        
+        return jsonify({
+            'updated': datetime.now().isoformat(),
+            'source': 'ESPN NBA Injuries (Live)',
+            'teams': teams,
+            'injured_players': injured_players,
+            'total': len(injured_players)
+        })
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'updated': datetime.now().isoformat(),
+            'source': 'Error fetching injuries',
+            'teams': {},
+            'injured_players': []
+        }), 500
 
 @app.route('/api/games/today')
 def get_games():
@@ -80,8 +117,23 @@ def analyze():
     try:
         props = request.get_json().get('props', [])
         results, locks = [], []
+        
+        # Get injured players
+        try:
+            inj_resp = get_injuries()
+            inj_data = inj_resp.get_json()
+            injured = inj_data.get('injured_players', [])
+        except:
+            injured = []
+        
         for p in props:
             name, line, stat = p.get('name',''), float(p.get('line',0)), p.get('stat','pts')
+            
+            # Check if injured
+            if name.lower() in injured:
+                results.append({'name': name, 'verdict': 'SKIP', 'reason': 'INJURED'})
+                continue
+            
             pid = find_player(name)
             if not pid:
                 results.append({'name': name, 'verdict': 'SKIP', 'reason': 'Not found'})
@@ -102,7 +154,7 @@ def analyze():
                 results.append({'name': name, 'avg': round(avg,1), 'edge': round(edge,1), 'games': games, 'verdict': f'🔒 LOCK {direction}'})
             else:
                 results.append({'name': name, 'avg': round(avg,1), 'edge': round(edge,1), 'games': games, 'verdict': 'SKIP'})
-        return jsonify({'results': results, 'locks': locks, 'lock_count': len(locks)})
+        return jsonify({'results': results, 'locks': locks, 'lock_count': len(locks), 'injuries_checked': len(injured)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
