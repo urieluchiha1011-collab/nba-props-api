@@ -114,16 +114,54 @@ def get_team_stats(abbr):
         if df.empty:
             return jsonify({'error': 'No games found'}), 404
         
+        # Overall record
         wins = len(df[df['WL'] == 'W'])
         losses = len(df[df['WL'] == 'L'])
         
+        # Home/Away records
+        home_games = df[df['MATCHUP'].str.contains('vs.')]
+        away_games = df[df['MATCHUP'].str.contains('@')]
+        home_wins = len(home_games[home_games['WL'] == 'W'])
+        home_losses = len(home_games[home_games['WL'] == 'L'])
+        away_wins = len(away_games[away_games['WL'] == 'W'])
+        away_losses = len(away_games[away_games['WL'] == 'L'])
+        
+        # Last 10
         last10 = df.head(10)
         l10_wins = len(last10[last10['WL'] == 'W'])
         
+        # Streak
+        streak = 0
+        streak_type = df.iloc[0]['WL'] if len(df) > 0 else 'W'
+        for _, row in df.iterrows():
+            if row['WL'] == streak_type:
+                streak += 1
+            else:
+                break
+        
+        # PPG and Opponent PPG
         ppg = df['PTS'].mean()
         
+        # Calculate opponent points from the game log
+        # We need to figure out opponent scores - use point differential
+        # PTS is our score, we can estimate opponent from win/loss margin
+        opp_pts_list = []
+        for _, row in df.iterrows():
+            our_pts = row['PTS']
+            # Estimate opponent points (this is approximate)
+            if row['WL'] == 'W':
+                # We won, opponent scored less
+                opp_pts_list.append(our_pts - abs(row.get('PLUS_MINUS', 5) if 'PLUS_MINUS' in df.columns else 5))
+            else:
+                # We lost, opponent scored more
+                opp_pts_list.append(our_pts + abs(row.get('PLUS_MINUS', 5) if 'PLUS_MINUS' in df.columns else 5))
+        
+        opp_ppg = sum(opp_pts_list) / len(opp_pts_list) if opp_pts_list else ppg
+        diff = ppg - opp_ppg
+        
+        # Recent 5 games
         recent = []
-        for _, row in df.head(10).iterrows():
+        for _, row in df.head(5).iterrows():
             recent.append({
                 'date': row['GAME_DATE'],
                 'matchup': row['MATCHUP'],
@@ -134,8 +172,13 @@ def get_team_stats(abbr):
         return jsonify({
             'team': team,
             'record': {'wins': wins, 'losses': losses},
+            'home': {'wins': home_wins, 'losses': home_losses},
+            'away': {'wins': away_wins, 'losses': away_losses},
             'last10': str(l10_wins) + '-' + str(10-l10_wins),
+            'streak': streak_type + str(streak),
             'ppg': round(ppg, 1),
+            'opp_ppg': round(opp_ppg, 1),
+            'diff': round(diff, 1),
             'games': len(df),
             'recent': recent
         })
