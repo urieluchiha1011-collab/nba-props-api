@@ -94,5 +94,15 @@ def get_games():
         return jsonify({'date': datetime.now().strftime('%Y-%m-%d'), 'games': games, 'count': len(games)})
     except Exception as e:
         return jsonify({'error': str(e), 'games': []}), 500
+        @app.route('/api/injuries')
+def get_injuries():
+    # Note: Returns empty on Render (no Java for PDF parsing)
+    return jsonify({
+        'updated': datetime.now().isoformat(),
+        'source': 'Cached data (Java required for live)',
+        'teams': {},
+        'injured_players': [],
+        'message': 'Live injuries require Java - run locally'
+    })
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
