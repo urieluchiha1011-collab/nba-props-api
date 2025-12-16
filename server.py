@@ -1,7 +1,7 @@
 import os
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from nba_api.stats.endpoints import playergamelog, commonplayerinfo
+from nba_api.stats.endpoints import playergamelog
 from nba_api.stats.static import players
 from nba_api.live.nba.endpoints import scoreboard
 from datetime import datetime
@@ -19,6 +19,35 @@ def find_player(name):
 @app.route('/api/health')
 def health():
     return jsonify({'status': 'ok', 'time': datetime.now().isoformat()})
+
+@app.route('/api/injuries')
+def get_injuries():
+    return jsonify({
+        'updated': datetime.now().isoformat(),
+        'source': 'Cached (Java required for live)',
+        'teams': {},
+        'injured_players': []
+    })
+
+@app.route('/api/games/today')
+def get_games():
+    try:
+        board = scoreboard.ScoreBoard()
+        data = board.get_dict()
+        games = []
+        for g in data.get('scoreboard', {}).get('games', []):
+            games.append({
+                'game_id': g.get('gameId'),
+                'home_team': g.get('homeTeam', {}).get('teamTricode'),
+                'away_team': g.get('awayTeam', {}).get('teamTricode'),
+                'home_score': g.get('homeTeam', {}).get('score'),
+                'away_score': g.get('awayTeam', {}).get('score'),
+                'status': g.get('gameStatusText'),
+                'start_time': g.get('gameTimeUTC')
+            })
+        return jsonify({'date': datetime.now().strftime('%Y-%m-%d'), 'games': games, 'count': len(games)})
+    except Exception as e:
+        return jsonify({'error': str(e), 'games': []}), 500
 
 @app.route('/api/player/<name>')
 def get_player(name):
@@ -38,7 +67,9 @@ def get_player(name):
                 'pts': round(df['PTS'].mean(), 1),
                 'reb': round(df['REB'].mean(), 1),
                 'ast': round(df['AST'].mean(), 1),
-                'fg3m': round(df['FG3M'].mean(), 1)
+                'fg3m': round(df['FG3M'].mean(), 1),
+                'stl': round(df['STL'].mean(), 1),
+                'blk': round(df['BLK'].mean(), 1)
             }
         })
     except Exception as e:
@@ -60,7 +91,7 @@ def analyze():
             if df.empty:
                 results.append({'name': name, 'verdict': 'SKIP', 'reason': 'No games'})
                 continue
-            stat_map = {'pts':'PTS','points':'PTS','reb':'REB','rebounds':'REB','ast':'AST','assists':'AST','fg3m':'FG3M','3pm':'FG3M'}
+            stat_map = {'pts':'PTS','points':'PTS','reb':'REB','rebounds':'REB','ast':'AST','assists':'AST','fg3m':'FG3M','3pm':'FG3M','stl':'STL','steals':'STL','blk':'BLK','blocks':'BLK'}
             col = stat_map.get(stat.lower(), 'PTS')
             avg = df[col].mean()
             edge = avg - line
@@ -74,35 +105,6 @@ def analyze():
         return jsonify({'results': results, 'locks': locks, 'lock_count': len(locks)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-@app.route('/api/games/today')
-def get_games():
-    try:
-        from nba_api.live.nba.endpoints import scoreboard
-        board = scoreboard.ScoreBoard()
-        data = board.get_dict()
-        games = []
-        for g in data.get('scoreboard', {}).get('games', []):
-            games.append({
-                'game_id': g.get('gameId'),
-                'home_team': g.get('homeTeam', {}).get('teamTricode'),
-                'away_team': g.get('awayTeam', {}).get('teamTricode'),
-                'home_score': g.get('homeTeam', {}).get('score'),
-                'away_score': g.get('awayTeam', {}).get('score'),
-                'status': g.get('gameStatusText'),
-                'start_time': g.get('gameTimeUTC')
-            })
-        return jsonify({'date': datetime.now().strftime('%Y-%m-%d'), 'games': games, 'count': len(games)})
-    except Exception as e:
-        return jsonify({'error': str(e), 'games': []}), 500
-        @app.route('/api/injuries')
-def get_injuries():
-    # Note: Returns empty on Render (no Java for PDF parsing)
-    return jsonify({
-        'updated': datetime.now().isoformat(),
-        'source': 'Cached data (Java required for live)',
-        'teams': {},
-        'injured_players': [],
-        'message': 'Live injuries require Java - run locally'
-    })
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
