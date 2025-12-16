@@ -101,7 +101,7 @@ def get_team_stats(abbr):
             return jsonify({'error': 'Team not found'}), 404
         
         time.sleep(0.6)
-        log = teamgamelog.TeamGameLog(team_id=team['id'], season='2024-25')
+        log = teamgamelog.TeamGameLog(team_id=team['id'], season='2025-26')
         df = log.get_data_frames()[0]
         
         if df.empty:
@@ -167,7 +167,7 @@ def get_player(name):
         if not pid:
             return jsonify({'error': 'Player not found'}), 404
         time.sleep(0.6)
-        log = playergamelog.PlayerGameLog(player_id=pid, season='2024-25')
+        log = playergamelog.PlayerGameLog(player_id=pid, season='2025-26')
         df = log.get_data_frames()[0]
         if df.empty:
             del df, log
@@ -237,7 +237,7 @@ def analyze():
             
             try:
                 time.sleep(0.5)
-                log = playergamelog.PlayerGameLog(player_id=pid, season='2024-25')
+                log = playergamelog.PlayerGameLog(player_id=pid, season='2025-26')
                 df = log.get_data_frames()[0]
                 
                 if df.empty:
