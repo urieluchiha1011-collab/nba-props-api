@@ -1,4 +1,5 @@
 import os
+import gc
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from nba_api.stats.endpoints import playergamelog, teamgamelog
@@ -11,21 +12,20 @@ import requests
 app = Flask(__name__)
 CORS(app)
 
-# ESPN to NBA team abbreviation mapping
-ESPN_TO_NBA = {
-    'GS': 'GSW', 'SA': 'SAS', 'NY': 'NYK', 'NO': 'NOP',
-    'UTAH': 'UTA', 'WSH': 'WAS'
-}
+# Cache players/teams list once at startup
+ALL_PLAYERS = players.get_players()
+ALL_TEAMS = teams.get_teams()
 
 def find_player(name):
-    for p in players.get_players():
-        if name.lower() in p['full_name'].lower():
-            return p['id']
-    return None
+    name_lower = name.lower()
+    for p in ALL_PLAYERS:
+        if name_lower in p['full_name'].lower():
+            return p['id'], p['full_name']
+    return None, None
 
 def find_team(abbr):
     abbr = abbr.upper()
-    for t in teams.get_teams():
+    for t in ALL_TEAMS:
         if t['abbreviation'] == abbr:
             return t
     return None
@@ -43,11 +43,11 @@ def get_injuries():
         
         teams_data = {}
         injured_players = []
+        ESPN_TO_NBA = {'GS': 'GSW', 'SA': 'SAS', 'NY': 'NYK', 'NO': 'NOP', 'UTAH': 'UTA', 'WSH': 'WAS'}
         
         for team in data.get('injuries', []):
             espn_abbr = team.get('team', {}).get('abbreviation', 'UNK')
             team_abbr = ESPN_TO_NBA.get(espn_abbr, espn_abbr)
-            
             if team_abbr not in teams_data:
                 teams_data[team_abbr] = []
             
@@ -55,13 +55,7 @@ def get_injuries():
                 name = player.get('athlete', {}).get('displayName', '')
                 status = player.get('status', '')
                 reason = player.get('details', {}).get('detail', '') or player.get('longComment', '')
-                
-                teams_data[team_abbr].append({
-                    'name': name,
-                    'status': status,
-                    'reason': reason
-                })
-                
+                teams_data[team_abbr].append({'name': name, 'status': status, 'reason': reason})
                 if status in ['Out', 'Questionable', 'Doubtful', 'Day-To-Day']:
                     injured_players.append(name.lower())
         
@@ -97,8 +91,7 @@ def get_games():
 
 @app.route('/api/teams')
 def get_teams():
-    all_teams = teams.get_teams()
-    return jsonify({'teams': [{'id': t['id'], 'abbreviation': t['abbreviation'], 'full_name': t['full_name'], 'city': t['city']} for t in all_teams]})
+    return jsonify({'teams': [{'id': t['id'], 'abbreviation': t['abbreviation'], 'full_name': t['full_name'], 'city': t['city']} for t in ALL_TEAMS]})
 
 @app.route('/api/team/<abbr>')
 def get_team_stats(abbr):
@@ -114,11 +107,9 @@ def get_team_stats(abbr):
         if df.empty:
             return jsonify({'error': 'No games found'}), 404
         
-        # Overall record
         wins = len(df[df['WL'] == 'W'])
         losses = len(df[df['WL'] == 'L'])
         
-        # Home/Away records
         home_games = df[df['MATCHUP'].str.contains('vs.')]
         away_games = df[df['MATCHUP'].str.contains('@')]
         home_wins = len(home_games[home_games['WL'] == 'W'])
@@ -126,11 +117,9 @@ def get_team_stats(abbr):
         away_wins = len(away_games[away_games['WL'] == 'W'])
         away_losses = len(away_games[away_games['WL'] == 'L'])
         
-        # Last 10
         last10 = df.head(10)
         l10_wins = len(last10[last10['WL'] == 'W'])
         
-        # Streak
         streak = 0
         streak_type = df.iloc[0]['WL'] if len(df) > 0 else 'W'
         for _, row in df.iterrows():
@@ -139,27 +128,9 @@ def get_team_stats(abbr):
             else:
                 break
         
-        # PPG and Opponent PPG
         ppg = df['PTS'].mean()
+        opp_ppg = ppg - df['PLUS_MINUS'].mean() if 'PLUS_MINUS' in df.columns else ppg
         
-        # Calculate opponent points from the game log
-        # We need to figure out opponent scores - use point differential
-        # PTS is our score, we can estimate opponent from win/loss margin
-        opp_pts_list = []
-        for _, row in df.iterrows():
-            our_pts = row['PTS']
-            # Estimate opponent points (this is approximate)
-            if row['WL'] == 'W':
-                # We won, opponent scored less
-                opp_pts_list.append(our_pts - abs(row.get('PLUS_MINUS', 5) if 'PLUS_MINUS' in df.columns else 5))
-            else:
-                # We lost, opponent scored more
-                opp_pts_list.append(our_pts + abs(row.get('PLUS_MINUS', 5) if 'PLUS_MINUS' in df.columns else 5))
-        
-        opp_ppg = sum(opp_pts_list) / len(opp_pts_list) if opp_pts_list else ppg
-        diff = ppg - opp_ppg
-        
-        # Recent 5 games
         recent = []
         for _, row in df.head(5).iterrows():
             recent.append({
@@ -168,6 +139,10 @@ def get_team_stats(abbr):
                 'result': row['WL'],
                 'pts': int(row['PTS'])
             })
+        
+        # Clean up memory
+        del df, log
+        gc.collect()
         
         return jsonify({
             'team': team,
@@ -178,26 +153,29 @@ def get_team_stats(abbr):
             'streak': streak_type + str(streak),
             'ppg': round(ppg, 1),
             'opp_ppg': round(opp_ppg, 1),
-            'diff': round(diff, 1),
-            'games': len(df),
+            'diff': round(ppg - opp_ppg, 1),
             'recent': recent
         })
     except Exception as e:
+        gc.collect()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/player/<name>')
 def get_player(name):
     try:
-        pid = find_player(name)
+        pid, full_name = find_player(name)
         if not pid:
             return jsonify({'error': 'Player not found'}), 404
         time.sleep(0.6)
         log = playergamelog.PlayerGameLog(player_id=pid, season='2024-25')
         df = log.get_data_frames()[0]
         if df.empty:
+            del df, log
+            gc.collect()
             return jsonify({'error': 'No games found'}), 404
-        return jsonify({
-            'name': name,
+        
+        result = {
+            'name': full_name,
             'games': len(df),
             'averages': {
                 'pts': round(df['PTS'].mean(), 1),
@@ -207,8 +185,12 @@ def get_player(name):
                 'stl': round(df['STL'].mean(), 1),
                 'blk': round(df['BLK'].mean(), 1)
             }
-        })
+        }
+        del df, log
+        gc.collect()
+        return jsonify(result)
     except Exception as e:
+        gc.collect()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/analyze', methods=['POST'])
@@ -218,14 +200,28 @@ def analyze():
         results = []
         locks = []
         
+        # Get injured players (cached call)
+        injured = []
         try:
-            inj_resp = get_injuries()
-            inj_data = inj_resp.get_json()
-            injured = inj_data.get('injured_players', [])
+            inj_resp = requests.get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries", timeout=5)
+            for team in inj_resp.json().get('injuries', []):
+                for player in team.get('injuries', []):
+                    if player.get('status') in ['Out', 'Questionable', 'Doubtful']:
+                        injured.append(player.get('athlete', {}).get('displayName', '').lower())
         except:
-            injured = []
+            pass
         
-        for p in props:
+        stat_map = {
+            'pts': 'PTS', 'points': 'PTS',
+            'reb': 'REB', 'rebounds': 'REB',
+            'ast': 'AST', 'assists': 'AST',
+            'fg3m': 'FG3M', '3pm': 'FG3M', 'threes': 'FG3M',
+            'stl': 'STL', 'steals': 'STL',
+            'blk': 'BLK', 'blocks': 'BLK'
+        }
+        
+        # Process max 10 players to save memory
+        for p in props[:10]:
             name = p.get('name', '')
             line = float(p.get('line', 0))
             stat = p.get('stat', 'pts')
@@ -234,58 +230,62 @@ def analyze():
                 results.append({'name': name, 'verdict': 'SKIP', 'reason': 'INJURED'})
                 continue
             
-            pid = find_player(name)
+            pid, full_name = find_player(name)
             if not pid:
                 results.append({'name': name, 'verdict': 'SKIP', 'reason': 'Not found'})
                 continue
             
-            time.sleep(0.6)
-            df = playergamelog.PlayerGameLog(player_id=pid, season='2024-25').get_data_frames()[0]
-            
-            if df.empty:
-                results.append({'name': name, 'verdict': 'SKIP', 'reason': 'No games'})
-                continue
-            
-            stat_map = {
-                'pts': 'PTS', 'points': 'PTS',
-                'reb': 'REB', 'rebounds': 'REB',
-                'ast': 'AST', 'assists': 'AST',
-                'fg3m': 'FG3M', '3pm': 'FG3M',
-                'stl': 'STL', 'steals': 'STL',
-                'blk': 'BLK', 'blocks': 'BLK'
-            }
-            col = stat_map.get(stat.lower(), 'PTS')
-            avg = df[col].mean()
-            edge = avg - line
-            games = len(df)
-            
-            if abs(edge) >= 6 and games >= 18:
-                direction = 'OVER' if edge > 0 else 'UNDER'
-                locks.append({
-                    'name': name,
-                    'line': line,
-                    'stat': stat,
-                    'direction': direction,
-                    'edge': round(edge, 1),
-                    'avg': round(avg, 1),
-                    'games': games
-                })
-                results.append({
-                    'name': name,
-                    'avg': round(avg, 1),
-                    'edge': round(edge, 1),
-                    'games': games,
-                    'verdict': '🔒 LOCK ' + direction
-                })
-            else:
-                results.append({
-                    'name': name,
-                    'avg': round(avg, 1),
-                    'edge': round(edge, 1),
-                    'games': games,
-                    'verdict': 'SKIP'
-                })
+            try:
+                time.sleep(0.5)
+                log = playergamelog.PlayerGameLog(player_id=pid, season='2024-25')
+                df = log.get_data_frames()[0]
+                
+                if df.empty:
+                    results.append({'name': full_name, 'verdict': 'SKIP', 'reason': 'No games'})
+                    del df, log
+                    gc.collect()
+                    continue
+                
+                col = stat_map.get(stat.lower(), 'PTS')
+                avg = float(df[col].mean())
+                edge = avg - line
+                games = len(df)
+                
+                # Clean up immediately
+                del df, log
+                gc.collect()
+                
+                if abs(edge) >= 6 and games >= 18:
+                    direction = 'OVER' if edge > 0 else 'UNDER'
+                    locks.append({
+                        'name': full_name,
+                        'line': line,
+                        'stat': stat,
+                        'direction': direction,
+                        'edge': round(edge, 1),
+                        'avg': round(avg, 1),
+                        'games': games
+                    })
+                    results.append({
+                        'name': full_name,
+                        'avg': round(avg, 1),
+                        'edge': round(edge, 1),
+                        'games': games,
+                        'verdict': '🔒 LOCK ' + direction
+                    })
+                else:
+                    results.append({
+                        'name': full_name,
+                        'avg': round(avg, 1),
+                        'edge': round(edge, 1),
+                        'games': games,
+                        'verdict': 'SKIP'
+                    })
+            except Exception as e:
+                results.append({'name': name, 'verdict': 'SKIP', 'reason': str(e)[:50]})
+                gc.collect()
         
+        gc.collect()
         return jsonify({
             'results': results,
             'locks': locks,
@@ -293,6 +293,7 @@ def analyze():
             'injuries_checked': len(injured)
         })
     except Exception as e:
+        gc.collect()
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
