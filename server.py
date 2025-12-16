@@ -11,6 +11,12 @@ import requests
 app = Flask(__name__)
 CORS(app)
 
+# ESPN to NBA team abbreviation mapping
+ESPN_TO_NBA = {
+    'GS': 'GSW', 'SA': 'SAS', 'NY': 'NYK', 'NO': 'NOP',
+    'UTAH': 'UTA', 'WSH': 'WAS'
+}
+
 def find_player(name):
     for p in players.get_players():
         if name.lower() in p['full_name'].lower():
@@ -39,8 +45,11 @@ def get_injuries():
         injured_players = []
         
         for team in data.get('injuries', []):
-            team_abbr = team.get('team', {}).get('abbreviation', 'UNK')
-            teams_data[team_abbr] = []
+            espn_abbr = team.get('team', {}).get('abbreviation', 'UNK')
+            team_abbr = ESPN_TO_NBA.get(espn_abbr, espn_abbr)
+            
+            if team_abbr not in teams_data:
+                teams_data[team_abbr] = []
             
             for player in team.get('injuries', []):
                 name = player.get('athlete', {}).get('displayName', '')
@@ -112,7 +121,6 @@ def get_team_stats(abbr):
         l10_wins = len(last10[last10['WL'] == 'W'])
         
         ppg = df['PTS'].mean()
-        opp_ppg = df['PTS'].mean() - df['PLUS_MINUS'].mean()
         
         recent = []
         for _, row in df.head(10).iterrows():
@@ -120,8 +128,7 @@ def get_team_stats(abbr):
                 'date': row['GAME_DATE'],
                 'matchup': row['MATCHUP'],
                 'result': row['WL'],
-                'pts': int(row['PTS']),
-                'plus_minus': int(row['PLUS_MINUS'])
+                'pts': int(row['PTS'])
             })
         
         return jsonify({
@@ -129,8 +136,6 @@ def get_team_stats(abbr):
             'record': {'wins': wins, 'losses': losses},
             'last10': str(l10_wins) + '-' + str(10-l10_wins),
             'ppg': round(ppg, 1),
-            'opp_ppg': round(opp_ppg, 1),
-            'diff': round(ppg - opp_ppg, 1),
             'games': len(df),
             'recent': recent
         })
