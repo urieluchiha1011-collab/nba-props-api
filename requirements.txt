@@ -1,5 +1,45 @@
-flask
-flask-cors
-gunicorn
-nba_api
-pandas
+# ═══════════════════════════════════════════════════════════════
+# NBA PROPS ANALYZER - REQUIREMENTS
+# ALL DATA FROM GITHUB PACKAGES (Official NBA Sources)
+# AUTO-UPDATES EVERY FEW SECONDS
+# ═══════════════════════════════════════════════════════════════
+
+# Core Framework
+flask>=2.0.0
+flask-cors>=3.0.10
+
+# ═══════════════════════════════════════════════════════════════
+# GITHUB: swar/nba_api
+# Official NBA Stats from stats.nba.com
+# https://github.com/swar/nba_api
+# Auto-updates: Games every 10s, Player stats cached 5 min
+# ═══════════════════════════════════════════════════════════════
+nba_api>=1.4.1
+
+# ═══════════════════════════════════════════════════════════════
+# GITHUB: mxufc29/nbainjuries  
+# Official NBA Injury Reports
+# https://github.com/mxufc29/nbainjuries
+# Auto-updates: Every 30 seconds
+# ═══════════════════════════════════════════════════════════════
+nbainjuries>=0.1.0
+
+# Dependencies
+pandas>=1.5.0
+numpy>=1.21.0
+
+# ═══════════════════════════════════════════════════════════════
+# AUTO-UPDATE INTERVALS:
+#   • Live Games: Every 10 seconds
+#   • Injuries: Every 30 seconds  
+#   • Player Stats: Cached for 5 minutes
+#
+# IMPORTANT: nbainjuries requires Java for PDF processing
+# 
+# Install Java:
+#   Ubuntu/Debian: apt-get install default-jre
+#   macOS: brew install java
+#   Windows: Download from java.com
+#
+# The package uses tabula-py to parse official NBA injury PDFs
+# ═══════════════════════════════════════════════════════════════
