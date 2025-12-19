@@ -6,9 +6,10 @@ from datetime import datetime
 import time
 import threading
 from threading import Thread, Lock
+import requests
 
 # ═══════════════════════════════════════════════════════════════
-# GITHUB PACKAGES ONLY - NO EXTERNAL APIS
+# GITHUB PACKAGES ONLY - NO EXTERNAL APIS (except ESPN for injuries)
 # ═══════════════════════════════════════════════════════════════
 
 # GitHub: swar/nba_api - Official NBA Stats
@@ -16,25 +17,8 @@ from nba_api.stats.endpoints import playergamelog, teamgamelog
 from nba_api.stats.static import players, teams
 from nba_api.live.nba.endpoints import scoreboard
 
-# GitHub: mxufc29/nbainjuries - Official NBA Injury Reports
-# Note: Requires Java - will fail gracefully if Java not installed
-HAS_NBA_INJURIES = False
-nba_injury = None
-
-def try_load_nbainjuries():
-    """Attempt to load nbainjuries - fails gracefully if Java missing"""
-    global HAS_NBA_INJURIES, nba_injury
-    try:
-        from nbainjuries import injury as _nba_injury
-        nba_injury = _nba_injury
-        HAS_NBA_INJURIES = True
-        print("✅ nbainjuries package loaded (GitHub: mxufc29/nbainjuries)")
-        return True
-    except Exception as e:
-        print(f"⚠️ nbainjuries not available (requires Java): {e}")
-        return False
-
-# Don't import at module level - try later in background thread
+# ESPN Injury API (FREE, no auth, no Java!)
+ESPN_INJURY_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
 
 app = Flask(__name__)
 CORS(app)
@@ -87,89 +71,69 @@ def find_team(abbr):
 # ═══════════════════════════════════════════════════════════════
 
 def update_injuries_loop():
-    """Background thread: Update injuries every 30 seconds"""
-    global CACHE, HAS_NBA_INJURIES
-    print(f"🔄 Injuries updater started (every {INJURY_UPDATE_INTERVAL}s)")
+    """Background thread: Update injuries every 30 seconds using ESPN API"""
+    global CACHE
+    print(f"🔄 Injuries updater started (every {INJURY_UPDATE_INTERVAL}s) - Using ESPN API")
     
-    # Try to load nbainjuries once at thread start
-    tried_loading = False
+    # ESPN team abbreviation mapping
+    ESPN_TO_NBA = {
+        'GS': 'GSW', 'SA': 'SAS', 'NY': 'NYK', 'NO': 'NOP', 
+        'UTAH': 'UTA', 'WSH': 'WAS', 'PHX': 'PHO'
+    }
     
     while True:
         try:
-            # Try loading nbainjuries once
-            if not tried_loading and not HAS_NBA_INJURIES:
-                tried_loading = True
-                try_load_nbainjuries()
+            response = requests.get(ESPN_INJURY_URL, timeout=10)
             
-            if HAS_NBA_INJURIES and nba_injury is not None:
-                try:
-                    now = datetime.now()
-                    report = nba_injury.get_reportdata(now, return_df=True)
+            if response.status_code == 200:
+                data = response.json()
+                teams_data = {}
+                injured_players = []
+                
+                for team in data.get('injuries', []):
+                    espn_abbr = team.get('team', {}).get('abbreviation', 'UNK')
+                    team_abbr = ESPN_TO_NBA.get(espn_abbr, espn_abbr)
                     
-                    if report is not None and not report.empty:
-                        teams_data = {}
-                        injured_players = []
+                    if team_abbr not in teams_data:
+                        teams_data[team_abbr] = []
+                    
+                    for player in team.get('injuries', []):
+                        name = player.get('athlete', {}).get('displayName', '')
+                        status = player.get('status', '')
+                        reason = player.get('details', {}).get('detail', '') or player.get('longComment', '')
                         
-                        for _, row in report.iterrows():
-                            team_abbr = str(row.get('Team', row.get('team', 'UNK')))
-                            player_name = str(row.get('Player', row.get('player', row.get('Name', ''))))
-                            status = str(row.get('Status', row.get('status', row.get('Game Status', ''))))
-                            reason = str(row.get('Reason', row.get('reason', row.get('Description', ''))))
-                            
-                            if team_abbr not in teams_data:
-                                teams_data[team_abbr] = []
-                            
-                            teams_data[team_abbr].append({
-                                'name': player_name,
-                                'status': status,
-                                'reason': reason
-                            })
-                            
-                            status_lower = status.lower()
-                            if any(s in status_lower for s in ['out', 'questionable', 'doubtful', 'day-to-day']):
-                                injured_players.append(player_name.lower())
+                        teams_data[team_abbr].append({
+                            'name': name,
+                            'status': status,
+                            'reason': reason
+                        })
                         
-                        with CACHE_LOCK:
-                            CACHE['injuries'] = {
-                                'data': {
-                                    'teams': teams_data,
-                                    'injured_players': injured_players,
-                                    'total': len(injured_players)
-                                },
-                                'updated': datetime.now().isoformat(),
-                                'source': 'nbainjuries (GitHub: mxufc29/nbainjuries)'
-                            }
-                        print(f"✅ [{datetime.now().strftime('%H:%M:%S')}] Injuries updated: {len(injured_players)} players")
-                    else:
-                        # No data returned - could be off-season or no games today
-                        with CACHE_LOCK:
-                            if CACHE['injuries']['updated'] is None:
-                                CACHE['injuries'] = {
-                                    'data': {'teams': {}, 'injured_players': [], 'total': 0},
-                                    'updated': datetime.now().isoformat(),
-                                    'source': 'nbainjuries - No injury reports available'
-                                }
-                        print(f"ℹ️ [{datetime.now().strftime('%H:%M:%S')}] No injury data available")
-                except Exception as e:
-                    print(f"⚠️ nbainjuries fetch error: {e}")
-                    with CACHE_LOCK:
-                        if CACHE['injuries']['updated'] is None:
-                            CACHE['injuries'] = {
-                                'data': {'teams': {}, 'injured_players': [], 'total': 0},
-                                'updated': datetime.now().isoformat(),
-                                'source': f'nbainjuries error: {str(e)[:50]}'
-                            }
-            else:
-                # nbainjuries not available - set status once
+                        if status in ['Out', 'Questionable', 'Doubtful', 'Day-To-Day']:
+                            injured_players.append(name.lower())
+                
                 with CACHE_LOCK:
-                    if CACHE['injuries']['updated'] is None:
-                        CACHE['injuries'] = {
-                            'data': {'teams': {}, 'injured_players': [], 'total': 0},
-                            'updated': datetime.now().isoformat(),
-                            'source': 'Injury data unavailable (nbainjuries requires Java)'
-                        }
+                    CACHE['injuries'] = {
+                        'data': {
+                            'teams': teams_data,
+                            'injured_players': injured_players,
+                            'total': len(injured_players)
+                        },
+                        'updated': datetime.now().isoformat(),
+                        'source': 'ESPN NBA Injuries (Live)'
+                    }
+                print(f"✅ [{datetime.now().strftime('%H:%M:%S')}] Injuries updated: {len(injured_players)} players")
+            else:
+                print(f"⚠️ ESPN API returned status {response.status_code}")
+                
         except Exception as e:
-            print(f"⚠️ Injury update loop error: {e}")
+            print(f"⚠️ Injury update error: {e}")
+            with CACHE_LOCK:
+                if CACHE['injuries']['updated'] is None:
+                    CACHE['injuries'] = {
+                        'data': {'teams': {}, 'injured_players': [], 'total': 0},
+                        'updated': datetime.now().isoformat(),
+                        'source': f'ESPN API error: {str(e)[:30]}'
+                    }
         
         time.sleep(INJURY_UPDATE_INTERVAL)
 
@@ -262,7 +226,7 @@ def health():
         },
         'sources': {
             'stats': 'nba_api (GitHub: swar/nba_api)',
-            'injuries': 'nbainjuries (GitHub: mxufc29/nbainjuries)' if HAS_NBA_INJURIES else 'Not available'
+            'injuries': 'ESPN NBA Injuries API (Live)'
         }
     })
 
@@ -585,7 +549,7 @@ if __name__ == '__main__':
     print("🏀 NBA PROPS API - GITHUB APIS ONLY")
     print("═" * 60)
     print("Stats: nba_api (GitHub: swar/nba_api)")
-    print("Injuries: nbainjuries (GitHub: mxufc29/nbainjuries)")
+    print("Injuries: ESPN API (Live, No Java Required)")
     print("═" * 60)
     
     # Run Flask server (for local dev)
