@@ -2,19 +2,60 @@ import os
 import gc
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from datetime import datetime
+import time
+import threading
+from threading import Thread, Lock
+
+# ═══════════════════════════════════════════════════════════════
+# GITHUB PACKAGES ONLY - NO EXTERNAL APIS
+# ═══════════════════════════════════════════════════════════════
+
+# GitHub: swar/nba_api - Official NBA Stats
 from nba_api.stats.endpoints import playergamelog, teamgamelog
 from nba_api.stats.static import players, teams
 from nba_api.live.nba.endpoints import scoreboard
-from datetime import datetime
-import time
-import requests
+
+# GitHub: mxufc29/nbainjuries - Official NBA Injury Reports
+try:
+    from nbainjuries import injury as nba_injury
+    HAS_NBA_INJURIES = True
+    print("✅ nbainjuries package loaded (GitHub: mxufc29/nbainjuries)")
+except ImportError:
+    HAS_NBA_INJURIES = False
+    print("⚠️ nbainjuries not installed - pip install nbainjuries")
 
 app = Flask(__name__)
 CORS(app)
 
+# ═══════════════════════════════════════════════════════════════
+# AUTO-UPDATE SYSTEM - REFRESHES EVERY FEW SECONDS
+# ═══════════════════════════════════════════════════════════════
+
+# Update intervals (in seconds)
+INJURY_UPDATE_INTERVAL = 30    # Injuries every 30 seconds
+GAMES_UPDATE_INTERVAL = 10     # Live games every 10 seconds
+PLAYER_CACHE_TTL = 300         # Player stats cache for 5 minutes
+
+# Thread-safe cache
+CACHE = {
+    'injuries': {
+        'data': {'teams': {}, 'injured_players': [], 'total': 0},
+        'updated': None,
+        'source': 'loading...'
+    },
+    'games': {
+        'data': {'games': [], 'count': 0, 'date': ''},
+        'updated': None
+    },
+    'players': {}  # player_id -> {data, timestamp}
+}
+CACHE_LOCK = Lock()
+
 # Cache players/teams list once at startup
 ALL_PLAYERS = players.get_players()
 ALL_TEAMS = teams.get_teams()
+print(f"✅ Loaded {len(ALL_PLAYERS)} players and {len(ALL_TEAMS)} teams")
 
 def find_player(name):
     name_lower = name.lower()
@@ -30,68 +71,206 @@ def find_team(abbr):
             return t
     return None
 
+# ═══════════════════════════════════════════════════════════════
+# BACKGROUND UPDATE THREADS
+# ═══════════════════════════════════════════════════════════════
+
+def update_injuries_loop():
+    """Background thread: Update injuries every 30 seconds"""
+    global CACHE
+    print(f"🔄 Injuries updater started (every {INJURY_UPDATE_INTERVAL}s)")
+    
+    while True:
+        try:
+            if HAS_NBA_INJURIES:
+                now = datetime.now()
+                report = nba_injury.get_reportdata(now, return_df=True)
+                
+                if report is not None and not report.empty:
+                    teams_data = {}
+                    injured_players = []
+                    
+                    for _, row in report.iterrows():
+                        team_abbr = str(row.get('Team', row.get('team', 'UNK')))
+                        player_name = str(row.get('Player', row.get('player', row.get('Name', ''))))
+                        status = str(row.get('Status', row.get('status', row.get('Game Status', ''))))
+                        reason = str(row.get('Reason', row.get('reason', row.get('Description', ''))))
+                        
+                        if team_abbr not in teams_data:
+                            teams_data[team_abbr] = []
+                        
+                        teams_data[team_abbr].append({
+                            'name': player_name,
+                            'status': status,
+                            'reason': reason
+                        })
+                        
+                        status_lower = status.lower()
+                        if any(s in status_lower for s in ['out', 'questionable', 'doubtful', 'day-to-day']):
+                            injured_players.append(player_name.lower())
+                    
+                    with CACHE_LOCK:
+                        CACHE['injuries'] = {
+                            'data': {
+                                'teams': teams_data,
+                                'injured_players': injured_players,
+                                'total': len(injured_players)
+                            },
+                            'updated': datetime.now().isoformat(),
+                            'source': 'nbainjuries (GitHub: mxufc29/nbainjuries)'
+                        }
+                    print(f"✅ [{datetime.now().strftime('%H:%M:%S')}] Injuries updated: {len(injured_players)} players")
+        except Exception as e:
+            print(f"⚠️ Injury update error: {e}")
+        
+        time.sleep(INJURY_UPDATE_INTERVAL)
+
+def update_games_loop():
+    """Background thread: Update live games every 10 seconds"""
+    global CACHE
+    print(f"🔄 Games updater started (every {GAMES_UPDATE_INTERVAL}s)")
+    
+    while True:
+        try:
+            board = scoreboard.ScoreBoard()
+            data = board.get_dict()
+            games = []
+            
+            for g in data.get('scoreboard', {}).get('games', []):
+                home = g.get('homeTeam', {})
+                away = g.get('awayTeam', {})
+                
+                games.append({
+                    'game_id': g.get('gameId'),
+                    'home_team': home.get('teamTricode'),
+                    'away_team': away.get('teamTricode'),
+                    'home_score': home.get('score', 0),
+                    'away_score': away.get('score', 0),
+                    'status': g.get('gameStatusText'),
+                    'start_time': g.get('gameTimeUTC'),
+                    'period': g.get('period', 0),
+                    'game_clock': g.get('gameClock', ''),
+                    'home_record': f"{home.get('wins', 0)}-{home.get('losses', 0)}",
+                    'away_record': f"{away.get('wins', 0)}-{away.get('losses', 0)}"
+                })
+            
+            with CACHE_LOCK:
+                CACHE['games'] = {
+                    'data': {
+                        'games': games,
+                        'count': len(games),
+                        'date': datetime.now().strftime('%Y-%m-%d')
+                    },
+                    'updated': datetime.now().isoformat()
+                }
+            print(f"✅ [{datetime.now().strftime('%H:%M:%S')}] Games updated: {len(games)} games")
+        except Exception as e:
+            print(f"⚠️ Games update error: {e}")
+        
+        time.sleep(GAMES_UPDATE_INTERVAL)
+
+def start_auto_updates():
+    """Start all background update threads"""
+    print("\n" + "═" * 60)
+    print("🚀 STARTING AUTO-UPDATE SYSTEM")
+    print("═" * 60)
+    
+    # Start injury updater
+    t1 = Thread(target=update_injuries_loop, daemon=True)
+    t1.start()
+    
+    # Start games updater
+    t2 = Thread(target=update_games_loop, daemon=True)
+    t2.start()
+    
+    print("═" * 60)
+    print("✅ Auto-updates running!")
+    print(f"   • Injuries: Every {INJURY_UPDATE_INTERVAL} seconds")
+    print(f"   • Games: Every {GAMES_UPDATE_INTERVAL} seconds")
+    print("═" * 60 + "\n")
+
+# ═══════════════════════════════════════════════════════════════
+# API ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
+
 @app.route('/api/health')
 def health():
-    return jsonify({'status': 'ok', 'time': datetime.now().isoformat()})
+    with CACHE_LOCK:
+        injuries_updated = CACHE['injuries']['updated']
+        games_updated = CACHE['games']['updated']
+    
+    return jsonify({
+        'status': 'ok',
+        'time': datetime.now().isoformat(),
+        'auto_update': {
+            'injuries': {
+                'interval': f'{INJURY_UPDATE_INTERVAL}s',
+                'last_update': injuries_updated
+            },
+            'games': {
+                'interval': f'{GAMES_UPDATE_INTERVAL}s', 
+                'last_update': games_updated
+            }
+        },
+        'sources': {
+            'stats': 'nba_api (GitHub: swar/nba_api)',
+            'injuries': 'nbainjuries (GitHub: mxufc29/nbainjuries)' if HAS_NBA_INJURIES else 'Not available'
+        }
+    })
 
 @app.route('/api/injuries')
 def get_injuries():
-    try:
-        url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        
-        teams_data = {}
-        injured_players = []
-        ESPN_TO_NBA = {'GS': 'GSW', 'SA': 'SAS', 'NY': 'NYK', 'NO': 'NOP', 'UTAH': 'UTA', 'WSH': 'WAS'}
-        
-        for team in data.get('injuries', []):
-            espn_abbr = team.get('team', {}).get('abbreviation', 'UNK')
-            team_abbr = ESPN_TO_NBA.get(espn_abbr, espn_abbr)
-            if team_abbr not in teams_data:
-                teams_data[team_abbr] = []
-            
-            for player in team.get('injuries', []):
-                name = player.get('athlete', {}).get('displayName', '')
-                status = player.get('status', '')
-                reason = player.get('details', {}).get('detail', '') or player.get('longComment', '')
-                teams_data[team_abbr].append({'name': name, 'status': status, 'reason': reason})
-                if status in ['Out', 'Questionable', 'Doubtful', 'Day-To-Day']:
-                    injured_players.append(name.lower())
-        
-        return jsonify({
-            'updated': datetime.now().isoformat(),
-            'source': 'ESPN NBA Injuries (Live)',
-            'teams': teams_data,
-            'injured_players': injured_players,
-            'total': len(injured_players)
-        })
-    except Exception as e:
-        return jsonify({'error': str(e), 'teams': {}, 'injured_players': []}), 500
+    """Get cached injuries (auto-updated every 30s)"""
+    with CACHE_LOCK:
+        cached = CACHE['injuries'].copy()
+    
+    return jsonify({
+        'updated': cached['updated'],
+        'source': cached['source'],
+        'teams': cached['data']['teams'],
+        'injured_players': cached['data']['injured_players'],
+        'total': cached['data']['total'],
+        'auto_refresh': f'Every {INJURY_UPDATE_INTERVAL} seconds',
+        'next_update_in': f'{INJURY_UPDATE_INTERVAL}s'
+    })
 
 @app.route('/api/games/today')
 def get_games():
-    try:
-        board = scoreboard.ScoreBoard()
-        data = board.get_dict()
-        games = []
-        for g in data.get('scoreboard', {}).get('games', []):
-            games.append({
-                'game_id': g.get('gameId'),
-                'home_team': g.get('homeTeam', {}).get('teamTricode'),
-                'away_team': g.get('awayTeam', {}).get('teamTricode'),
-                'home_score': g.get('homeTeam', {}).get('score'),
-                'away_score': g.get('awayTeam', {}).get('score'),
-                'status': g.get('gameStatusText'),
-                'start_time': g.get('gameTimeUTC')
-            })
-        return jsonify({'date': datetime.now().strftime('%Y-%m-%d'), 'games': games, 'count': len(games)})
-    except Exception as e:
-        return jsonify({'error': str(e), 'games': []}), 500
+    """Get cached live games (auto-updated every 10s)"""
+    with CACHE_LOCK:
+        cached = CACHE['games'].copy()
+    
+    return jsonify({
+        'date': cached['data'].get('date', datetime.now().strftime('%Y-%m-%d')),
+        'games': cached['data'].get('games', []),
+        'count': cached['data'].get('count', 0),
+        'updated': cached['updated'],
+        'auto_refresh': f'Every {GAMES_UPDATE_INTERVAL} seconds',
+        'source': 'nba_api (GitHub: swar/nba_api)'
+    })
+
+@app.route('/api/games/live')
+def get_live_scores():
+    """Get live scores with real-time data"""
+    with CACHE_LOCK:
+        cached = CACHE['games'].copy()
+    
+    live_games = [g for g in cached['data'].get('games', []) 
+                  if g.get('period', 0) > 0 and 'Final' not in str(g.get('status', ''))]
+    
+    return jsonify({
+        'live_games': live_games,
+        'count': len(live_games),
+        'updated': cached['updated'],
+        'auto_refresh': f'Every {GAMES_UPDATE_INTERVAL} seconds'
+    })
 
 @app.route('/api/teams')
 def get_teams():
-    return jsonify({'teams': [{'id': t['id'], 'abbreviation': t['abbreviation'], 'full_name': t['full_name'], 'city': t['city']} for t in ALL_TEAMS]})
+    return jsonify({
+        'teams': [{'id': t['id'], 'abbreviation': t['abbreviation'], 'full_name': t['full_name'], 'city': t['city']} for t in ALL_TEAMS],
+        'source': 'nba_api (GitHub: swar/nba_api)'
+    })
 
 @app.route('/api/team/<abbr>')
 def get_team_stats(abbr):
@@ -140,7 +319,6 @@ def get_team_stats(abbr):
                 'pts': int(row['PTS'])
             })
         
-        # Clean up memory
         del df, log
         gc.collect()
         
@@ -154,21 +332,32 @@ def get_team_stats(abbr):
             'ppg': round(ppg, 1),
             'opp_ppg': round(opp_ppg, 1),
             'diff': round(ppg - opp_ppg, 1),
-            'recent': recent
+            'recent': recent,
+            'source': 'nba_api (GitHub: swar/nba_api)'
         })
     except Exception as e:
         gc.collect()
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/player/<name>')
+@app.route('/api/player/<n>')
 def get_player(name):
     try:
         pid, full_name = find_player(name)
         if not pid:
             return jsonify({'error': 'Player not found'}), 404
+        
+        # Check cache first
+        now = time.time()
+        with CACHE_LOCK:
+            if pid in CACHE['players']:
+                cached = CACHE['players'][pid]
+                if now - cached['timestamp'] < PLAYER_CACHE_TTL:
+                    return jsonify(cached['data'])
+        
         time.sleep(0.6)
         log = playergamelog.PlayerGameLog(player_id=pid, season='2025-26')
         df = log.get_data_frames()[0]
+        
         if df.empty:
             del df, log
             gc.collect()
@@ -184,14 +373,25 @@ def get_player(name):
                 'fg3m': round(df['FG3M'].mean(), 1),
                 'stl': round(df['STL'].mean(), 1),
                 'blk': round(df['BLK'].mean(), 1)
-            }
+            },
+            'source': 'nba_api (GitHub: swar/nba_api)',
+            'cached_until': datetime.fromtimestamp(now + PLAYER_CACHE_TTL).isoformat()
         }
+        
+        # Cache the result
+        with CACHE_LOCK:
+            CACHE['players'][pid] = {'data': result, 'timestamp': now}
+        
         del df, log
         gc.collect()
         return jsonify(result)
     except Exception as e:
         gc.collect()
         return jsonify({'error': str(e)}), 500
+
+# ═══════════════════════════════════════════════════════════════
+# PROP ANALYSIS ENDPOINT
+# ═══════════════════════════════════════════════════════════════
 
 @app.route('/api/analyze', methods=['POST'])
 def analyze():
@@ -200,34 +400,29 @@ def analyze():
         results = []
         locks = []
         
-        # Get injured players (cached call)
-        injured = []
-        try:
-            inj_resp = requests.get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries", timeout=5)
-            for team in inj_resp.json().get('injuries', []):
-                for player in team.get('injuries', []):
-                    if player.get('status') in ['Out', 'Questionable', 'Doubtful']:
-                        injured.append(player.get('athlete', {}).get('displayName', '').lower())
-        except:
-            pass
+        # Get injured players from cache (auto-updated)
+        with CACHE_LOCK:
+            injured = CACHE['injuries']['data']['injured_players'].copy()
+            injury_source = CACHE['injuries']['source']
         
         stat_map = {
             'pts': 'PTS', 'points': 'PTS',
             'reb': 'REB', 'rebounds': 'REB',
             'ast': 'AST', 'assists': 'AST',
-            'fg3m': 'FG3M', '3pm': 'FG3M', 'threes': 'FG3M',
+            'fg3m': 'FG3M', '3pm': 'FG3M', 'threes': 'FG3M', '3pt': 'FG3M',
             'stl': 'STL', 'steals': 'STL',
-            'blk': 'BLK', 'blocks': 'BLK'
+            'blk': 'BLK', 'blocks': 'BLK',
+            'tov': 'TOV', 'turnovers': 'TOV', 'turnover': 'TOV'
         }
         
-        # Process max 10 players to save memory
-        for p in props[:10]:
+        for p in props[:15]:
             name = p.get('name', '')
             line = float(p.get('line', 0))
             stat = p.get('stat', 'pts')
             
-            if name.lower() in injured:
-                results.append({'name': name, 'verdict': 'SKIP', 'reason': 'INJURED'})
+            # Check if injured (from auto-updated cache)
+            if any(name.lower() in inj or inj in name.lower() for inj in injured):
+                results.append({'name': name, 'verdict': 'SKIP', 'reason': 'INJURED', 'injured': True})
                 continue
             
             pid, full_name = find_player(name)
@@ -247,40 +442,71 @@ def analyze():
                     continue
                 
                 col = stat_map.get(stat.lower(), 'PTS')
+                values = df[col].tolist()
                 avg = float(df[col].mean())
+                median = float(df[col].median())
+                std_dev = float(df[col].std()) if len(df) > 1 else avg * 0.18
                 edge = avg - line
                 games = len(df)
                 
-                # Clean up immediately
+                # Hit rates
+                over_hits = len([v for v in values if v > line])
+                hit_rate = (over_hits / games * 100) if games > 0 else 0
+                
+                # Last 5 games
+                last5 = values[:5] if len(values) >= 5 else values
+                last5_avg = sum(last5) / len(last5) if last5 else avg
+                last5_hits = len([v for v in last5 if v > line])
+                
+                # Home/Away split
+                home_games = df[df['MATCHUP'].str.contains('vs.')]
+                away_games = df[df['MATCHUP'].str.contains('@')]
+                home_avg = float(home_games[col].mean()) if len(home_games) > 0 else avg
+                away_avg = float(away_games[col].mean()) if len(away_games) > 0 else avg
+                
+                # Confidence calculation
+                confidence = 50
+                confidence += min(25, max(-25, edge * 4))
+                if games >= 20: confidence += 10
+                elif games < 15: confidence -= 5
+                if abs(edge) >= 5: confidence += 8
+                if abs(edge) >= 7: confidence += 7
+                if hit_rate >= 70: confidence += 5
+                elif hit_rate <= 30: confidence -= 5
+                if last5_hits >= 4: confidence += 3
+                elif last5_hits <= 1: confidence -= 3
+                confidence = max(5, min(95, confidence))
+                
                 del df, log
                 gc.collect()
                 
-                if abs(edge) >= 6 and games >= 18:
-                    direction = 'OVER' if edge > 0 else 'UNDER'
-                    locks.append({
-                        'name': full_name,
-                        'line': line,
-                        'stat': stat,
-                        'direction': direction,
-                        'edge': round(edge, 1),
-                        'avg': round(avg, 1),
-                        'games': games
-                    })
-                    results.append({
-                        'name': full_name,
-                        'avg': round(avg, 1),
-                        'edge': round(edge, 1),
-                        'games': games,
-                        'verdict': '🔒 LOCK ' + direction
-                    })
+                direction = 'OVER' if edge > 0 else 'UNDER'
+                
+                result_data = {
+                    'name': full_name,
+                    'avg': round(avg, 1),
+                    'median': round(median, 1),
+                    'edge': round(edge, 1),
+                    'games': games,
+                    'hit_rate': round(hit_rate, 1),
+                    'last5_avg': round(last5_avg, 1),
+                    'last5_hits': last5_hits,
+                    'home_avg': round(home_avg, 1),
+                    'away_avg': round(away_avg, 1),
+                    'std_dev': round(std_dev, 2),
+                    'confidence': round(confidence)
+                }
+                
+                if confidence >= 85 and games >= 15:
+                    locks.append({**result_data, 'line': line, 'stat': stat, 'direction': direction})
+                    result_data['verdict'] = '🔒 LOCK ' + direction
+                elif confidence >= 75:
+                    result_data['verdict'] = '✅ GOOD ' + direction
                 else:
-                    results.append({
-                        'name': full_name,
-                        'avg': round(avg, 1),
-                        'edge': round(edge, 1),
-                        'games': games,
-                        'verdict': 'SKIP'
-                    })
+                    result_data['verdict'] = 'SKIP'
+                
+                results.append(result_data)
+                
             except Exception as e:
                 results.append({'name': name, 'verdict': 'SKIP', 'reason': str(e)[:50]})
                 gc.collect()
@@ -290,11 +516,29 @@ def analyze():
             'results': results,
             'locks': locks,
             'lock_count': len(locks),
-            'injuries_checked': len(injured)
+            'injuries_checked': len(injured),
+            'injury_source': injury_source,
+            'source': 'nba_api (GitHub: swar/nba_api)',
+            'injury_auto_refresh': f'Every {INJURY_UPDATE_INTERVAL}s'
         })
     except Exception as e:
         gc.collect()
         return jsonify({'error': str(e)}), 500
 
+# ═══════════════════════════════════════════════════════════════
+# START SERVER WITH AUTO-UPDATES
+# ═══════════════════════════════════════════════════════════════
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    print("\n" + "═" * 60)
+    print("🏀 NBA PROPS API - GITHUB APIS ONLY")
+    print("═" * 60)
+    print("Stats: nba_api (GitHub: swar/nba_api)")
+    print("Injuries: nbainjuries (GitHub: mxufc29/nbainjuries)")
+    print("═" * 60)
+    
+    # Start auto-update background threads
+    start_auto_updates()
+    
+    # Run Flask server
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), threaded=True)
