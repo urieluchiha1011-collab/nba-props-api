@@ -17,13 +17,24 @@ from nba_api.stats.static import players, teams
 from nba_api.live.nba.endpoints import scoreboard
 
 # GitHub: mxufc29/nbainjuries - Official NBA Injury Reports
-try:
-    from nbainjuries import injury as nba_injury
-    HAS_NBA_INJURIES = True
-    print("✅ nbainjuries package loaded (GitHub: mxufc29/nbainjuries)")
-except ImportError:
-    HAS_NBA_INJURIES = False
-    print("⚠️ nbainjuries not installed - pip install nbainjuries")
+# Note: Requires Java - will fail gracefully if Java not installed
+HAS_NBA_INJURIES = False
+nba_injury = None
+
+def try_load_nbainjuries():
+    """Attempt to load nbainjuries - fails gracefully if Java missing"""
+    global HAS_NBA_INJURIES, nba_injury
+    try:
+        from nbainjuries import injury as _nba_injury
+        nba_injury = _nba_injury
+        HAS_NBA_INJURIES = True
+        print("✅ nbainjuries package loaded (GitHub: mxufc29/nbainjuries)")
+        return True
+    except Exception as e:
+        print(f"⚠️ nbainjuries not available (requires Java): {e}")
+        return False
+
+# Don't import at module level - try later in background thread
 
 app = Flask(__name__)
 CORS(app)
@@ -77,51 +88,88 @@ def find_team(abbr):
 
 def update_injuries_loop():
     """Background thread: Update injuries every 30 seconds"""
-    global CACHE
+    global CACHE, HAS_NBA_INJURIES
     print(f"🔄 Injuries updater started (every {INJURY_UPDATE_INTERVAL}s)")
+    
+    # Try to load nbainjuries once at thread start
+    tried_loading = False
     
     while True:
         try:
-            if HAS_NBA_INJURIES:
-                now = datetime.now()
-                report = nba_injury.get_reportdata(now, return_df=True)
-                
-                if report is not None and not report.empty:
-                    teams_data = {}
-                    injured_players = []
+            # Try loading nbainjuries once
+            if not tried_loading and not HAS_NBA_INJURIES:
+                tried_loading = True
+                try_load_nbainjuries()
+            
+            if HAS_NBA_INJURIES and nba_injury is not None:
+                try:
+                    now = datetime.now()
+                    report = nba_injury.get_reportdata(now, return_df=True)
                     
-                    for _, row in report.iterrows():
-                        team_abbr = str(row.get('Team', row.get('team', 'UNK')))
-                        player_name = str(row.get('Player', row.get('player', row.get('Name', ''))))
-                        status = str(row.get('Status', row.get('status', row.get('Game Status', ''))))
-                        reason = str(row.get('Reason', row.get('reason', row.get('Description', ''))))
+                    if report is not None and not report.empty:
+                        teams_data = {}
+                        injured_players = []
                         
-                        if team_abbr not in teams_data:
-                            teams_data[team_abbr] = []
+                        for _, row in report.iterrows():
+                            team_abbr = str(row.get('Team', row.get('team', 'UNK')))
+                            player_name = str(row.get('Player', row.get('player', row.get('Name', ''))))
+                            status = str(row.get('Status', row.get('status', row.get('Game Status', ''))))
+                            reason = str(row.get('Reason', row.get('reason', row.get('Description', ''))))
+                            
+                            if team_abbr not in teams_data:
+                                teams_data[team_abbr] = []
+                            
+                            teams_data[team_abbr].append({
+                                'name': player_name,
+                                'status': status,
+                                'reason': reason
+                            })
+                            
+                            status_lower = status.lower()
+                            if any(s in status_lower for s in ['out', 'questionable', 'doubtful', 'day-to-day']):
+                                injured_players.append(player_name.lower())
                         
-                        teams_data[team_abbr].append({
-                            'name': player_name,
-                            'status': status,
-                            'reason': reason
-                        })
-                        
-                        status_lower = status.lower()
-                        if any(s in status_lower for s in ['out', 'questionable', 'doubtful', 'day-to-day']):
-                            injured_players.append(player_name.lower())
-                    
+                        with CACHE_LOCK:
+                            CACHE['injuries'] = {
+                                'data': {
+                                    'teams': teams_data,
+                                    'injured_players': injured_players,
+                                    'total': len(injured_players)
+                                },
+                                'updated': datetime.now().isoformat(),
+                                'source': 'nbainjuries (GitHub: mxufc29/nbainjuries)'
+                            }
+                        print(f"✅ [{datetime.now().strftime('%H:%M:%S')}] Injuries updated: {len(injured_players)} players")
+                    else:
+                        # No data returned - could be off-season or no games today
+                        with CACHE_LOCK:
+                            if CACHE['injuries']['updated'] is None:
+                                CACHE['injuries'] = {
+                                    'data': {'teams': {}, 'injured_players': [], 'total': 0},
+                                    'updated': datetime.now().isoformat(),
+                                    'source': 'nbainjuries - No injury reports available'
+                                }
+                        print(f"ℹ️ [{datetime.now().strftime('%H:%M:%S')}] No injury data available")
+                except Exception as e:
+                    print(f"⚠️ nbainjuries fetch error: {e}")
                     with CACHE_LOCK:
+                        if CACHE['injuries']['updated'] is None:
+                            CACHE['injuries'] = {
+                                'data': {'teams': {}, 'injured_players': [], 'total': 0},
+                                'updated': datetime.now().isoformat(),
+                                'source': f'nbainjuries error: {str(e)[:50]}'
+                            }
+            else:
+                # nbainjuries not available - set status once
+                with CACHE_LOCK:
+                    if CACHE['injuries']['updated'] is None:
                         CACHE['injuries'] = {
-                            'data': {
-                                'teams': teams_data,
-                                'injured_players': injured_players,
-                                'total': len(injured_players)
-                            },
+                            'data': {'teams': {}, 'injured_players': [], 'total': 0},
                             'updated': datetime.now().isoformat(),
-                            'source': 'nbainjuries (GitHub: mxufc29/nbainjuries)'
+                            'source': 'Injury data unavailable (nbainjuries requires Java)'
                         }
-                    print(f"✅ [{datetime.now().strftime('%H:%M:%S')}] Injuries updated: {len(injured_players)} players")
         except Exception as e:
-            print(f"⚠️ Injury update error: {e}")
+            print(f"⚠️ Injury update loop error: {e}")
         
         time.sleep(INJURY_UPDATE_INTERVAL)
 
@@ -529,6 +577,9 @@ def analyze():
 # START SERVER WITH AUTO-UPDATES
 # ═══════════════════════════════════════════════════════════════
 
+# Start auto-updates when module is loaded (works with gunicorn)
+start_auto_updates()
+
 if __name__ == '__main__':
     print("\n" + "═" * 60)
     print("🏀 NBA PROPS API - GITHUB APIS ONLY")
@@ -537,8 +588,5 @@ if __name__ == '__main__':
     print("Injuries: nbainjuries (GitHub: mxufc29/nbainjuries)")
     print("═" * 60)
     
-    # Start auto-update background threads
-    start_auto_updates()
-    
-    # Run Flask server
+    # Run Flask server (for local dev)
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), threaded=True)
